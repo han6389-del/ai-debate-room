@@ -1,7 +1,7 @@
 /* AI 아이디어 토론방 — 폰 브라우저가 구버전 index.html을 계속 보여 주지 않도록
    캐시 세대를 올리고, 화면(내비게이션) 요청은 항상 네트워크에서 새로 받는다.
    같은 오리진의 상위 서비스워커가 이 경로를 캐시로 가로채는 것도 막는다. */
-var CACHE = "adr-shell-v3-2026-11-22";
+var CACHE = "adr-shell-v4-2026-11-22";
 
 self.addEventListener("install", function(e){
   self.skipWaiting();

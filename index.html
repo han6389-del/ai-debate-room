@@ -374,7 +374,7 @@ select{
 
       <div class="keystate" id="keyState"></div>
 
-      <p class="footnote">API 키는 이 브라우저에만 저장되고 서버로 보내지 않아요.<br>토론 내용은 폰에 자동 저장돼요.<br><span style="opacity:.55;font-size:10.5px">v2 · 2026-11-22 · 모델 자동 확인</span></p>
+      <p class="footnote">API 키는 이 브라우저에만 저장되고 서버로 보내지 않아요.<br>토론 내용은 폰에 자동 저장돼요.<br><span style="opacity:.55;font-size:10.5px">v3 · 2026-11-22 · 혼잡 시 모델 자동 전환</span></p>
     </section>
 
     <!-- ================= CHAT ================= -->
@@ -993,6 +993,24 @@ function isModelMissing(err){
   return /(not found|not supported|does not exist|is not available)/i.test(msg) && /model/i.test(msg);
 }
 
+/* 구글 서버 혼잡(503)과 혼잡성 429 — 보통 '이 모델만 지금 붐빈다'는 뜻이라
+   다른 후보 모델로 넘어가면 바로 풀린다. 키 한도 소진(quota) 429는 여기서 제외한다. */
+var CONGEST_RE = /high demand|overload|over capacity|unavailable|resource[ _](?:has been )?exhausted|try again later|temporar/i;
+var QUOTA_RE = /exceeded your current quota|quota|billing|free tier/i;
+function isCongestion(err){
+  if(!err) return false;
+  if(err.status === 503) return true;
+  if(err.status !== 429) return false;
+  var msg = String(err.message || "");
+  if(CONGEST_RE.test(msg)) return true;
+  return !QUOTA_RE.test(msg);          // 설명이 빈약한 429도 혼잡으로 보고 다음 모델을 시도
+}
+function congestionError(last){
+  var e = new ApiError((last && last.status) || 503, (last && last.message) || "");
+  e.congestion = true;                 // 모든 후보가 혼잡했다는 표시
+  return e;
+}
+
 async function streamOnce(role, userText, model, onChunk, signal, useThinking){
   var key = (settings.apiKey || "").trim();
   var url = API_BASE + "/models/" + encodeURIComponent(model) +
@@ -1043,12 +1061,19 @@ async function streamOnce(role, userText, model, onChunk, signal, useThinking){
   return full.trim();
 }
 
-/* 모델이 바뀌거나 thinking 설정이 거부되면 스스로 고쳐 재시도한다. */
+/* 모델이 없거나(404), 구글이 혼잡하거나(503·429), thinking 설정이 거부되면 스스로 고쳐 재시도한다. */
 async function streamGemini(role, userText, onChunk, signal){
   var key = (settings.apiKey || "").trim();
-  var tried = [], refreshed = false, useThinking = true, emitted = false, lastErr = null;
+  var tried = [], refreshed = false, useThinking = true, emitted = false, lastErr = null, delay = 0;
   var model = await ensureModel();
-  for(var attempt=0; attempt<4; attempt++){
+  var maxAttempts = Math.min(candidates().length + 4, 14);
+  for(var attempt=0; attempt<maxAttempts; attempt++){
+    if(delay){                                   // 혼잡했던 모델은 잠깐 쉬었다가 다음 후보로
+      await sleep(delay); delay = 0;
+      if(state.stopped || (signal && signal.aborted)){
+        var stop = new Error("aborted"); stop.name = "AbortError"; throw stop;
+      }
+    }
     try{
       return await streamOnce(role, userText, model, function(chunk, full){ emitted = true; onChunk(chunk, full); }, signal, useThinking);
     }catch(err){
@@ -1059,6 +1084,18 @@ async function streamGemini(role, userText, onChunk, signal){
         thinkingBlocked[String(model).toLowerCase()] = true;
         useThinking = false;                     // thinkingConfig 없이 같은 모델로 한 번 더
         continue;
+      }
+      if(isCongestion(err)){                     // 503·429: 다음 후보 모델로 자동 폴백
+        tried.push(model);
+        var nxc = nextModel(tried);
+        if(nxc && nxc !== model){
+          model = nxc;
+          setModel(nxc, true);
+          useThinking = !thinkingBlocked[nxc.toLowerCase()];
+          delay = 500;
+          continue;
+        }
+        throw congestionError(err);              // 모든 후보가 혼잡할 때만 오류 카드
       }
       if(isModelMissing(err)){
         tried.push(model);
@@ -1087,6 +1124,9 @@ function extractText(obj){
 }
 
 function friendlyError(err){
+  if(err.congestion || err.status === 503){
+    return ["지금 구글 서버가 붐비네요", "지금 구글 서버에 사람이 몰려 다른 모델도 모두 잠깐 쉬고 있어요. 잠시 후 다시 눌러 보세요."];
+  }
   if(err.status === 400 || err.status === 403){
     if(/API key/i.test(err.message || "")) return ["API 키가 올바르지 않아요", "⚙️ 설정에서 키를 다시 확인해 주세요. AI Studio에서 새 키를 만들면 바로 됩니다."];
     return ["요청이 거부됐어요", (err.message || "") + " · 키에 제한(HTTP 리퍼러 등)이 걸려 있으면 해제해 주세요."];
