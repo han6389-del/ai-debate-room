@@ -270,6 +270,7 @@ textarea.topic:focus{border-color:#a5a2f0;background:#fff;box-shadow:0 0 0 4px r
 }
 .field input:focus{border-color:#a5a2f0;background:#fff}
 .field .mini{border:1px solid var(--line);background:#f7f8fc;border-radius:10px;padding:10px 11px;font-size:11.5px;font-weight:700;color:#4b5163;white-space:nowrap}
+.field select{flex:1;min-width:0}
 .status-line{font-size:11.5px;margin:8px 0 0;display:flex;align-items:center;gap:6px;color:var(--muted)}
 .status-line.ok{color:#15803d}
 .status-line.no{color:#b45309}
@@ -373,7 +374,7 @@ select{
 
       <div class="keystate" id="keyState"></div>
 
-      <p class="footnote">API 키는 이 브라우저에만 저장되고 서버로 보내지 않아요.<br>토론 내용은 폰에 자동 저장돼요.</p>
+      <p class="footnote">API 키는 이 브라우저에만 저장되고 서버로 보내지 않아요.<br>토론 내용은 폰에 자동 저장돼요.<br><span style="opacity:.55;font-size:10.5px">v2 · 2026-11-22 · 모델 자동 확인</span></p>
     </section>
 
     <!-- ================= CHAT ================= -->
@@ -433,13 +434,12 @@ select{
 
       <div class="sec">
         <h3>🧠 모델</h3>
-        <p class="hint">무료 한도가 넉넉한 <b>2.5 Flash</b>가 기본이에요. 더 깊은 사고가 필요하면 Pro로 바꾸세요(무료 한도 적음).</p>
-        <select id="selModel">
-          <option value="gemini-2.5-flash">gemini-2.5-flash · 균형 (추천)</option>
-          <option value="gemini-2.5-flash-lite">gemini-2.5-flash-lite · 가장 빠름</option>
-          <option value="gemini-2.5-pro">gemini-2.5-pro · 가장 똑똑 (느림)</option>
-          <option value="gemini-2.0-flash">gemini-2.0-flash · 구형 안정판</option>
-        </select>
+        <p class="hint">키를 저장하면 <b>그 키로 실제로 쓸 수 있는 모델</b>을 구글에 물어봐서 목록을 채우고, 가장 알맞은 Flash를 자동으로 골라요. 구글에서 모델이 바뀌어도 따로 손댈 필요 없습니다.</p>
+        <div class="field">
+          <select id="selModel"></select>
+          <button class="mini" id="btnRefreshModels" title="이 키로 쓸 수 있는 모델 다시 확인">↻</button>
+        </div>
+        <p class="status-line" id="modelStatus"></p>
       </div>
 
       <div class="sec">
@@ -502,7 +502,7 @@ var ORDER = ["idea","realist","critic"];
 /* ================= storage ================= */
 var LS_SET = "adr.settings.v1", LS_SES = "adr.sessions.v1";
 function loadSettings(){
-  var d = {apiKey:"", model:"gemini-2.5-flash", rounds:2, on:{idea:true,realist:true,critic:true,leader:true}, prompts:{}};
+  var d = {apiKey:"", model:"", rounds:2, on:{idea:true,realist:true,critic:true,leader:true}, prompts:{}};
   try{
     var raw = localStorage.getItem(LS_SET);
     if(raw){
@@ -603,7 +603,8 @@ function renderRoles(){
 function renderKeyState(){
   var box = $("keyState");
   if(settings.apiKey){
-    box.innerHTML = '<span class="dot"></span><span>Gemini 키 연결됨 · <b>'+esc(settings.model)+'</b></span>';
+    var label = settings.model || (modelState.ids[0] ? "자동(" + modelState.ids[0] + ")" : "자동 선택");
+    box.innerHTML = '<span class="dot"></span><span>Gemini 키 연결됨 · <b>'+esc(label)+'</b></span>';
   }else{
     box.innerHTML = '<span class="dot warn"></span><span>아직 API 키가 없어요. <b>샘플 데모</b>로 먼저 구경하거나, ⚙️에서 무료 키를 넣어 주세요.</span>';
   }
@@ -705,6 +706,212 @@ function addErrorCard(title, msg, actions){
 function ApiError(status, message){ this.name="ApiError"; this.status=status; this.message=message; }
 ApiError.prototype = Object.create(Error.prototype);
 
+/* ================= models: 이 키로 실제로 쓸 수 있는 모델 자동 확인 =================
+   구글은 모델을 자주 갈아치운다(2.5 → 3.8 …). 모델 이름을 코드에 박아 두면 404가 나므로,
+   키마다 GET /v1beta/models 를 불러 generateContent가 되는 모델만 골라 쓴다. */
+var API_BASE = "https://generativelanguage.googleapis.com/v1beta";
+var LS_MODELS = "adr.models.v2";
+var MODEL_TTL = 12*60*60*1000;   // 12시간 동안은 캐시 재사용
+/* 목록을 못 받아올 때 시도하는 순서(= 구글 무료 티어에 열려 있는 순서) */
+var PREFERRED_MODELS = [
+  "gemini-3.8-flash","gemini-3.6-flash","gemini-3.5-flash-lite","gemini-3.1-flash-lite",
+  "gemini-3-flash-preview","gemini-2.5-flash","gemini-2.5-flash-lite",
+  "gemma-4-31b-it","gemma-4-26b-a4b-it"
+];
+var MODEL_HINTS = {
+  "gemini-3.8-flash":"균형 · 최신 (추천)",
+  "gemini-3.6-flash":"빠른 균형",
+  "gemini-3.5-flash-lite":"가장 빠름",
+  "gemini-3.1-flash-lite":"가장 빠름 · 가벼움",
+  "gemini-3-flash-preview":"미리보기판",
+  "gemini-2.5-flash":"구형 · 기존 사용자만 열림",
+  "gemini-2.5-flash-lite":"구형 · 가장 빠름",
+  "gemma-4-31b-it":"오픈 모델 (Gemma)",
+  "gemma-4-26b-a4b-it":"오픈 모델 (Gemma)"
+};
+var thinkingBlocked = {};   // 400을 받은 모델은 thinkingConfig 없이 호출
+var modelState = { keyId:"", at:0, ids:[], names:{}, loading:false, pending:null, error:null };
+
+function keyIdOf(k){ k = (k||"").trim(); return k ? "k:" + k.slice(-8) : ""; }
+function loadModelCache(){
+  try{
+    var j = JSON.parse(localStorage.getItem(LS_MODELS) || "null");
+    if(j && j.keyId && Array.isArray(j.ids)) return j;
+  }catch(e){}
+  return null;
+}
+function saveModelCache(key, ids, names){
+  try{ localStorage.setItem(LS_MODELS, JSON.stringify({ keyId:keyIdOf(key), at:Date.now(), ids:ids, names:names||{} })); }catch(e){}
+}
+function withTimeout(p, ms){
+  return Promise.race([p, new Promise(function(_, rej){ setTimeout(function(){ rej(new Error("timeout")); }, ms); })]);
+}
+
+/* 대화에 쓸 수 있는 모델만 남긴다 (이미지·TTS·오디오·임베딩 등 제외) */
+function isChatModel(m){
+  var id = String((m && m.name) || "").replace(/^models\//, "");
+  if(!id) return false;
+  var methods = m.supportedGenerationMethods || [];
+  if(methods.length && methods.indexOf("generateContent") < 0) return false;
+  if(!/^(gemini|gemma)-/.test(id)) return false;
+  if(/(image|imagen|tts|audio|live|transcribe|embedding|embed|robotics|omni|veo|video|computer-use|deep-research|learnlm)/i.test(id)) return false;
+  if(/-\d{3}$/.test(id)) return false;          // gemini-2.5-flash-001 같은 고정 스냅샷
+  return true;
+}
+function rankModels(ids){
+  var uniq = [];
+  ids.forEach(function(id){ if(id && uniq.indexOf(id) < 0) uniq.push(id); });
+  function score(id){
+    var pref = PREFERRED_MODELS.indexOf(id);
+    var s = pref >= 0 ? (1000 - pref*10) : 0;     // 무료로 열려 있는 것으로 아는 순서
+    var v = /^gemini-(\d+)(?:\.(\d+))?/.exec(id);
+    var ver = v ? Number(v[1]) + (v[2] ? Number("0." + v[2]) : 0) : 0;
+    var tier = /flash(?!-lite)/.test(id) ? 30 : /flash-lite/.test(id) ? 20 : /pro/.test(id) ? 10 : 5;
+    if(/preview|exp|experimental/i.test(id)) s -= 15;
+    if(/^gemini-4/.test(id)) s -= 40;             // 4.x는 무료 한도가 불확실해 뒤로
+    return s + ver*10 + tier;
+  }
+  return uniq.slice().sort(function(a,b){ return score(b) - score(a); });
+}
+
+async function fetchModelList(key){
+  var ids = [], names = {}, pageToken = "", pages = 0;
+  do{
+    var url = API_BASE + "/models?pageSize=1000&key=" + encodeURIComponent(key);
+    if(pageToken) url += "&pageToken=" + encodeURIComponent(pageToken);
+    var res;
+    try{
+      res = await fetch(url, { method:"GET", cache:"no-store" });
+    }catch(e){
+      throw new ApiError(0, "모델 목록을 불러오지 못했어요 (네트워크)");
+    }
+    if(!res.ok){
+      var msg = "";
+      try{ var j = await res.json(); msg = (j.error && j.error.message) || ""; }catch(e2){}
+      throw new ApiError(res.status, msg);
+    }
+    var data = await res.json();
+    (data.models || []).forEach(function(m){
+      if(!isChatModel(m)) return;
+      var id = String(m.name || "").replace(/^models\//, "");
+      ids.push(id);
+      if(m.displayName) names[id] = m.displayName;
+    });
+    pageToken = data.nextPageToken || "";
+  }while(pageToken && ++pages < 5);
+  return { ids:ids, names:names };
+}
+
+function discoverModels(key, force){
+  key = (key || (settings.apiKey || "")).trim();
+  if(!key) return Promise.resolve([]);
+  if(!force){
+    var c = loadModelCache();
+    if(c && c.keyId === keyIdOf(key) && (Date.now() - c.at) < MODEL_TTL && c.ids.length){
+      modelState.keyId = c.keyId; modelState.at = c.at;
+      modelState.ids = rankModels(c.ids); modelState.names = c.names || {};
+      modelState.error = null;
+      renderModelOptions();
+      return Promise.resolve(modelState.ids);
+    }
+  }
+  if(modelState.pending) return modelState.pending;
+  modelState.loading = true; renderModelStatus();
+  modelState.pending = fetchModelList(key).then(function(r){
+    modelState.keyId = keyIdOf(key); modelState.at = Date.now(); modelState.error = null;
+    modelState.ids = rankModels(r.ids); modelState.names = r.names;
+    saveModelCache(key, r.ids, r.names);
+    // 저장해 둔 모델을 이 키가 못 쓰면 가장 알맞은 모델로 바꿔 둔다
+    if(modelState.ids.length && settings.model && modelState.ids.indexOf(settings.model) < 0){
+      setModel(modelState.ids[0], true);
+    }
+    return modelState.ids;
+  }).catch(function(err){
+    modelState.error = err;
+    console.warn("[models] 목록을 불러오지 못했어요:", err && err.status, err && err.message);
+    return [];
+  }).then(function(v){
+    modelState.loading = false; modelState.pending = null;
+    renderModelOptions(); renderKeyState();
+    return v;
+  });
+  return modelState.pending;
+}
+
+function candidates(){
+  return (modelState.ids && modelState.ids.length) ? modelState.ids.slice() : PREFERRED_MODELS.slice();
+}
+function nextModel(tried){
+  var list = candidates();
+  for(var i=0;i<list.length;i++){ if(tried.indexOf(list[i]) < 0) return list[i]; }
+  return "";
+}
+function setModel(id, silent){
+  if(!id) return;
+  settings.model = id;
+  saveSettings();
+  var sel = document.getElementById("selModel");
+  if(sel){ if(!Array.prototype.some.call(sel.options, function(o){ return o.value === id; })) renderModelOptions(); sel.value = id; }
+  renderModelStatus();
+  renderKeyState();
+  if(!silent) toast("모델: " + id);
+}
+function modelLabel(id){
+  if(MODEL_HINTS[id]) return id + " · " + MODEL_HINTS[id];
+  if(modelState.names && modelState.names[id]) return id + " · " + modelState.names[id];
+  return id;
+}
+function renderModelOptions(){
+  var sel = $("selModel"); if(!sel) return;
+  var cur = settings.model || "";
+  sel.innerHTML = "";
+  var auto = document.createElement("option");
+  auto.value = "";
+  auto.textContent = "자동 선택 · 이 키에 맞는 모델" + (modelState.ids.length ? " (" + modelState.ids[0] + ")" : "");
+  sel.appendChild(auto);
+  var ids = candidates().slice();
+  if(cur && ids.indexOf(cur) < 0) ids.unshift(cur);
+  ids.forEach(function(id){
+    var o = document.createElement("option");
+    o.value = id; o.textContent = modelLabel(id);
+    sel.appendChild(o);
+  });
+  sel.value = cur;
+  renderModelStatus();
+}
+function renderModelStatus(){
+  var s = $("modelStatus"); if(!s) return;
+  if(!settings.apiKey){ s.className = "status-line"; s.textContent = "키를 넣으면 쓸 수 있는 모델을 자동으로 확인해요."; return; }
+  if(modelState.loading){ s.className = "status-line"; s.textContent = "⏳ 이 키로 쓸 수 있는 모델을 확인하는 중…"; return; }
+  if(modelState.error && !modelState.ids.length){
+    s.className = "status-line no";
+    s.textContent = "목록을 못 불러왔어요 — 토론을 시작하면 실제로 되는 모델을 하나씩 시도해 맞춰요.";
+    return;
+  }
+  if(modelState.ids.length){
+    s.className = "status-line ok";
+    s.textContent = "✓ 쓸 수 있는 모델 " + modelState.ids.length + "개 확인 · 지금: " + (settings.model || ("자동(" + modelState.ids[0] + ")"));
+    return;
+  }
+  s.className = "status-line";
+  s.textContent = "아직 확인 전이에요. ↻ 를 눌러 확인하거나, 토론을 시작하면 자동으로 맞춰요.";
+}
+
+/* 토론 직전: 키로 쓸 수 있는 모델을 확인하고, 저장된 모델이 없거나 못 쓰는 모델이면 최적 Flash로 */
+async function ensureModel(){
+  var key = (settings.apiKey || "").trim();
+  if(!key) throw new ApiError(400, "API key not valid — 키가 없어요");
+  if(!modelState.ids.length){
+    await discoverModels(key, false);
+  }
+  var list = candidates();
+  var cur = settings.model || "";
+  if(!cur || (modelState.ids.length && list.indexOf(cur) < 0)){
+    if(list.length){ setModel(list[0], true); cur = list[0]; }
+  }
+  return cur || list[0];
+}
+
 function systemFor(role){
   var p = PERSONAS[role];
   var base = "너는 한국어로 토론하는 AI 참가자 '" + p.name + "'이다.\n" +
@@ -749,11 +956,23 @@ function buildPrompt(role, round, total, mode, session){
   return out.join("\n\n");
 }
 
-function geminiBody(system, userText, model){
-  var cfg = { temperature: 0.95, maxOutputTokens: 900 };
-  // thinking 제어는 2.5 flash 계열만 지원 (pro는 끌 수 없고, 2.0은 미지원)
-  if(model.indexOf("2.5") !== -1 && model.indexOf("pro") === -1){
-    cfg.thinkingConfig = { thinkingBudget: 0 };
+function thinkingFor(model){
+  var id = String(model || "").toLowerCase();
+  if(!id || id.indexOf("gemma") === 0) return null;
+  if(thinkingBlocked[id]) return null;
+  var m = /^gemini-(\d+)/.exec(id);
+  if(!m) return null;
+  var major = Number(m[1]);
+  if(major >= 3) return { thinkingLevel: "LOW" };   // 3.x는 thinkingBudget이 폐기, 4.x는 400
+  if(/pro/.test(id)) return null;                    // 2.5 Pro는 사고를 끌 수 없음
+  if(/flash-lite/.test(id)) return null;             // 2.5 flash-lite는 최소 예산이 있어 생략
+  return { thinkingBudget: 0 };                      // 2.5 flash: 사고 끄기
+}
+function geminiBody(system, userText, model, useThinking){
+  var cfg = { temperature: 0.95, maxOutputTokens: 2048 };
+  if(useThinking !== false){
+    var tc = thinkingFor(model);
+    if(tc) cfg.thinkingConfig = tc;
   }
   return {
     systemInstruction: { parts: [{ text: system }] },
@@ -762,17 +981,28 @@ function geminiBody(system, userText, model){
   };
 }
 
-async function streamGemini(role, userText, onChunk, signal){
+function isThinkingFieldError(err){
+  if(!err || err.status !== 400) return false;
+  var msg = String(err.message || "");
+  return /thinking|Unknown name|Cannot find field|Cannot find field/i.test(msg);
+}
+function isModelMissing(err){
+  if(!err) return false;
+  if(err.status === 404) return true;
+  var msg = String(err.message || "");
+  return /(not found|not supported|does not exist|is not available)/i.test(msg) && /model/i.test(msg);
+}
+
+async function streamOnce(role, userText, model, onChunk, signal, useThinking){
   var key = (settings.apiKey || "").trim();
-  var model = settings.model || "gemini-2.5-flash";
-  var url = "https://generativelanguage.googleapis.com/v1beta/models/" +
-    encodeURIComponent(model) + ":streamGenerateContent?alt=sse&key=" + encodeURIComponent(key);
+  var url = API_BASE + "/models/" + encodeURIComponent(model) +
+    ":streamGenerateContent?alt=sse&key=" + encodeURIComponent(key);
   var res;
   try{
     res = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(geminiBody(systemFor(role), userText, model)),
+      body: JSON.stringify(geminiBody(systemFor(role), userText, model, useThinking)),
       signal: signal
     });
   }catch(e){
@@ -812,6 +1042,43 @@ async function streamGemini(role, userText, onChunk, signal){
   }
   return full.trim();
 }
+
+/* 모델이 바뀌거나 thinking 설정이 거부되면 스스로 고쳐 재시도한다. */
+async function streamGemini(role, userText, onChunk, signal){
+  var key = (settings.apiKey || "").trim();
+  var tried = [], refreshed = false, useThinking = true, emitted = false, lastErr = null;
+  var model = await ensureModel();
+  for(var attempt=0; attempt<4; attempt++){
+    try{
+      return await streamOnce(role, userText, model, function(chunk, full){ emitted = true; onChunk(chunk, full); }, signal, useThinking);
+    }catch(err){
+      if(err && err.name === "AbortError") throw err;
+      lastErr = err;
+      if(emitted) throw err;                     // 이미 글자가 흘러나온 뒤에는 재시도하지 않음
+      if(isThinkingFieldError(err) && useThinking){
+        thinkingBlocked[String(model).toLowerCase()] = true;
+        useThinking = false;                     // thinkingConfig 없이 같은 모델로 한 번 더
+        continue;
+      }
+      if(isModelMissing(err)){
+        tried.push(model);
+        if(!refreshed){                          // 첫 404면 목록을 새로 받아 본다
+          refreshed = true;
+          try{ await withTimeout(discoverModels(key, true), 6000); }catch(e){}
+        }
+        var nxt = nextModel(tried);
+        if(nxt && nxt !== model){
+          model = nxt;
+          setModel(nxt, true);
+          useThinking = !thinkingBlocked[nxt.toLowerCase()];
+          continue;
+        }
+      }
+      throw err;
+    }
+  }
+  throw lastErr || new ApiError(404, "모델을 찾지 못했어요");
+}
 function extractText(obj){
   var c = obj && obj.candidates && obj.candidates[0];
   if(!c || !c.content || !c.content.parts) return "";
@@ -824,7 +1091,7 @@ function friendlyError(err){
     if(/API key/i.test(err.message || "")) return ["API 키가 올바르지 않아요", "⚙️ 설정에서 키를 다시 확인해 주세요. AI Studio에서 새 키를 만들면 바로 됩니다."];
     return ["요청이 거부됐어요", (err.message || "") + " · 키에 제한(HTTP 리퍼러 등)이 걸려 있으면 해제해 주세요."];
   }
-  if(err.status === 404) return ["모델을 찾지 못했어요", "설정에서 모델을 gemini-2.5-flash 로 바꿔 보세요."];
+  if(err.status === 404) return ["이 키로 쓸 수 있는 모델이 없어요", "⚙️ 설정에서 ↻ 를 눌러 모델 목록을 다시 불러와 주세요. 그래도 안 되면 AI Studio에서 새 키를 만들어 보세요."];
   if(err.status === 429) return ["무료 한도를 다 썼어요", "잠시(1분~하루) 기다린 뒤 다시 시도해 주세요. 모델을 flash-lite로 바꾸면 한도가 더 넉넉해요."];
   if(err.status === 0) return ["인터넷 연결을 확인해 주세요", "브라우저가 구글 서버에 닿지 못했어요. 광고 차단기나 사내망이면 잠시 꺼 보고 다시 시도해 보세요."];
   return ["토론이 잠깐 멈췄어요", (err.message || "알 수 없는 오류") + " (HTTP " + (err.status||"?") + ")"];
@@ -1138,7 +1405,8 @@ function openSettings(){
   $("inpKey").value = settings.apiKey || "";
   $("inpKey").type = "password";
   $("btnEye").textContent = "보기";
-  $("selModel").value = settings.model;
+  renderModelOptions();
+  if(settings.apiKey && !modelState.ids.length) discoverModels(settings.apiKey, false);
   renderKeyStatus();
   renderPersonaEdits();
   openSheet("sheetSettings");
@@ -1171,11 +1439,25 @@ function newDebate(){
   showSetup();
 }
 
-function startDebate(){
+async function startDebate(){
   var topic = $("topicInput").value.trim();
   if(!topic){ toast("토론 주제를 먼저 적어 주세요"); $("topicInput").focus(); return; }
   if(!settings.apiKey){ toast("먼저 무료 Gemini 키를 넣어 주세요"); openSettings(); return; }
   if(!activePersonas().length){ toast("역할을 하나 이상 켜 주세요"); return; }
+  if(state.starting) return;
+  state.starting = true;
+  $("btnStart").disabled = true;
+  // 시작 전에 이 키로 실제로 쓸 수 있는 모델을 확정한다 (못 받아오면 시작할 때마다 자동 시도)
+  if(!modelState.ids.length){
+    $("subtitle").textContent = "이 키로 쓸 수 있는 모델 확인 중…";
+    try{ await withTimeout(discoverModels(settings.apiKey, false), 6000); }catch(e){}
+    $("subtitle").textContent = "아이디어 하나 던지면 4명이 토론해 줘요";
+  }
+  if(modelState.ids.length && settings.model && modelState.ids.indexOf(settings.model) < 0){
+    setModel(modelState.ids[0], true);
+  }
+  state.starting = false;
+  $("btnStart").disabled = false;
   state.abort = new AbortController();
   state.rounds = state.rounds || 2;
   newSession(topic, false, state.rounds);
@@ -1246,14 +1528,34 @@ $("btnEye").onclick = function(){
   else{ i.type = "password"; this.textContent = "보기"; }
 };
 $("btnSaveSettings").onclick = function(){
-  settings.apiKey = $("inpKey").value.trim();
-  settings.model = $("selModel").value;
+  var newKey = $("inpKey").value.trim();
+  var keyChanged = newKey !== (settings.apiKey || "");
+  settings.apiKey = newKey;
+  settings.model = $("selModel").value || "";
   saveSettings();
-  renderKeyState(); renderRoles();
+  renderKeyState(); renderRoles(); renderModelOptions();
   closeSheet("sheetSettings");
   toast(settings.apiKey ? "설정을 저장했어요 ✓" : "저장했어요 — 키는 나중에 넣어도 돼요");
+  if(newKey){
+    discoverModels(newKey, keyChanged).then(function(ids){
+      if(ids && ids.length){ renderKeyState(); toast("모델 확인 완료 · " + (settings.model || ("자동(" + ids[0] + ")"))); }
+      else if(keyChanged){ toast("키는 저장했어요 — 모델은 토론 시작 때 자동으로 맞춰요"); }
+    });
+  }
 };
-$("selModel").onchange = function(){ settings.model = this.value; saveSettings(); renderKeyState(); };
+$("selModel").onchange = function(){ settings.model = this.value; saveSettings(); renderKeyState(); renderModelStatus(); };
+$("btnRefreshModels").onclick = function(){
+  var btn = this;
+  var k = ($("inpKey") && $("inpKey").value.trim()) || settings.apiKey || "";
+  if(!k){ toast("먼저 키를 넣어 주세요"); if($("inpKey")) $("inpKey").focus(); return; }
+  btn.disabled = true; btn.textContent = "⏳";
+  discoverModels(k, true).then(function(ids){
+    btn.disabled = false; btn.textContent = "↻";
+    renderModelOptions(); renderKeyState();
+    if(ids && ids.length) toast("쓸 수 있는 모델 " + ids.length + "개 · " + (settings.model || ids[0]));
+    else toast("목록을 못 불러왔어요 — 토론을 시작하면 자동으로 맞춰요");
+  });
+};
 Array.prototype.forEach.call(document.querySelectorAll("[data-close]"), function(b){
   b.onclick = function(){ closeSheet(b.dataset.close); };
 });
@@ -1270,8 +1572,10 @@ if("serviceWorker" in navigator && location.protocol === "https:"){
 renderChips();
 renderRounds();
 renderRoles();
+renderModelOptions();
 renderKeyState();
 updateTopicCount();
+if(settings.apiKey){ discoverModels(settings.apiKey, false); }
 window.__adr = { state:state, settings:settings, DEMO:DEMO };
 })();
 </script>
