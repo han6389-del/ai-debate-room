@@ -1066,6 +1066,7 @@ async function streamGemini(role, userText, onChunk, signal){
   var key = (settings.apiKey || "").trim();
   var tried = [], refreshed = false, useThinking = true, emitted = false, lastErr = null, delay = 0;
   var model = await ensureModel();
+  var preferred = model;                         // 모두 혼잡할 때는 사용자가 고른 모델로 되돌린다
   var maxAttempts = Math.min(candidates().length + 4, 14);
   for(var attempt=0; attempt<maxAttempts; attempt++){
     if(delay){                                   // 혼잡했던 모델은 잠깐 쉬었다가 다음 후보로
@@ -1095,6 +1096,7 @@ async function streamGemini(role, userText, onChunk, signal){
           delay = 500;
           continue;
         }
+        if(settings.model !== preferred) setModel(preferred, true);   // 마지막 후보로 남기지 않는다
         throw congestionError(err);              // 모든 후보가 혼잡할 때만 오류 카드
       }
       if(isModelMissing(err)){
