@@ -984,7 +984,7 @@ function geminiBody(system, userText, model, useThinking){
 function isThinkingFieldError(err){
   if(!err || err.status !== 400) return false;
   var msg = String(err.message || "");
-  return /thinking|Unknown name|Cannot find field|Cannot find field/i.test(msg);
+  return /thinking|Unknown name|Cannot find field/i.test(msg);
 }
 function isModelMissing(err){
   if(!err) return false;
